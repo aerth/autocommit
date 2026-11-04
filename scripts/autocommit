@@ -1,0 +1,514 @@
+#!/bin/bash
+# ac autocommit project (https://github.com/aerth/autocommit)
+#
+# autocommit (base git commiter)
+# should output only the new SHA head to stdout
+# ALL OUTPUT ON STDERR EXCEPT FOR FINAL SHA
+#trap 'echo "ohnooo error $? ${*}" 1>&2; { return $? 2>/dev/null || return 42; }' INT
+trap 'exit 1 2>/dev/null || exit $?' SIGUSR1
+
+if command -v gum >/dev/null 2>&1; then
+	gumlog() {
+		# shellcheck disable=SC1001 ## the backslash is for easy skip in find-and-replaceaa
+		CLICOLOR_FORCE=1 FORCE_COLOR=1 gum \log --prefix="autocommit" "${@}" 1>&2
+	}
+else
+	gumlog() {
+		echo -e "[autocommit] ${@}" 1>&2
+	}
+fi
+
+loadenv() {
+	## config from env
+	grep -q -s -e OLLAMA_MODEL -e OLLAMA_THINK ~/.config/git/autocommit.env &&
+		source ~/.config/git/autocommit.env
+	grep -q -s -e AC_OLLAMA_MODEL -e AC_OLLAMA_THINK .env && source .env
+	OLLAMA_HOST="${OLLAMA_HOST-"https://ollama.home.arpa"}"
+	#LLM_MODEL="${LLM_MODEL-"gemma4:12b"}"
+	if [[ -z $OLLAMA_MODEL ]]; then
+		echo Error: Need OLLAMA_MODEL env 1>&2
+		exit 3
+	fi
+	OLLAMA_MODEL="${OLLAMA_MODEL-"gemma4:26b"}"
+	OLLAMA_THINK=${OLLAMA_THINK:-false}
+	if [ "$OLLAMA_MODEL" = "gpt-oss:20b" ] && [ "${OLLAMA_THINK-off}" == "off" ]; then
+		OLLAMA_THINK=low
+	fi
+	gumlog -l debug "MODEL=$OLLAMA_MODEL THINK=$OLLAMA_THINK"
+	export GIT_AUTHOR_NAME=${GIT_AUTHOR_NAME-"${NAME-"developer"}"}
+	export GIT_AUTHOR_EMAIL=${GIT_AUTHOR_EMAIL-"${GIT_AUTHOR_NAME}@localhost"}
+	export GIT_COMMITTER_NAME=${GIT_COMMITTER_NAME-"${GIT_AUTHOR_NAME}"}
+	export GIT_COMMITTER_EMAIL=${GIT_COMMITTER_EMAIL-"${GIT_AUTHOR_EMAIL}"}
+}
+print() {
+	if [ -z "${*}" ]; then
+		echo 1>&2
+		return 0
+	fi
+	gumlog -l debug "${*}" 1>&2
+}
+infobox() {
+	echo -e "autocommit: ${*}" | gum style \
+		--foreground 2 \
+		--bold \
+		--border double \
+		--border-foreground 2 \
+		--padding "1 2" 1>&2
+}
+errorbox() {
+	echo -e "autocommit: ${*}" | gum style \
+		--foreground 1 \
+		--bold \
+		--border double \
+		--border-foreground 1 \
+		--padding "1 2" 1>&2
+}
+die() {
+	errorbox "oh no .. ${*}"
+	kill -SIGUSR1 $$
+	(return 1 2>/dev/null) || exit 1
+}
+fatal() {
+	errorbox "fatal oh no .. ${*}"
+	kill -SIGUSR1 $$
+	#gumlog -l fatal "${*}"
+	#  (return 1 2>/dev/null) || return 1
+}
+
+## initial state
+PREV_SHA=${PREV_SHA-$(git rev-parse HEAD)} #|| die "Could not find current git sha"
+undo() {
+	if [ -z "$PREV_SHA" ]; then
+		die "Could not find current git sha"
+	fi
+	gum confirm --default=No "undo commit message?" || return 1
+	git reset --soft "$PREV_SHA" || return 42
+	gumlog -l info "Rolled back to $PREV_SHA"
+	die "completed undo"
+}
+
+#### FLAGS
+#CURL_FLAGS=()
+#DIFF_FLAGS=()
+[[ -v CURL_FLAGS ]] || CURL_FLAGS=(--no-progress-bar -s)
+[[ -v DIFF_FLAGS ]] || DIFF_FLAGS=()
+
+autocommit_parse_flags() {
+
+	# -y flag
+	#set -x
+	autoconfirm=0
+	silent_mode=${silent_mode-0}
+	for i in 1 2; do
+		if [ "${1-}" = "-q" ]; then
+			#gumlog -l warn "silent mode"
+			silent_mode=1
+			export GUM_LOG_LEVEL=warn
+			shift
+		fi
+		if [ "${1-}" = "-y" ]; then
+			autoconfirm=1
+			shift
+		fi
+	done
+	if [ "${#}" != 0 ]; then
+		DIFF_FLAGS=()
+		is_dashed=0
+		while IFS= read -r arg; do
+			#gumlog -l debug "checking $arg" 1>&2
+			[[ $arg != '-'* ]] && [ $is_dashed = 0 ] && is_dashed=1 && DIFF_FLAGS+=('--' "$arg") && continue
+			DIFF_FLAGS+=("$arg")
+		done <<<"${@}"
+	fi
+	if [ "${#}" == 0 ]; then
+		DIFF_FLAGS=("--")
+	fi
+	# < <(find -mindepth ${1} -maxdepth ${1} -not -path '*/.git/*' -not -path '*/venv/*' -not -path '*/node_modules/*' -not -path '*/venv/*' -not -path '*/data/*' -not -path '*/.*' -not -path '*/*.log' -not -path "$HOME/source" || return 2)
+
+	#  DIFF_FLAGS=("${@}")
+	CURL_FLAGS=(--no-progress-bar -s)
+	if [ "$silent_mode" = 0 ]; then
+		CURL_FLAGS=(--progress-bar)
+		if [ "${verbose_mode-}" = 1 ]; then
+			CURL_FLAGS+=(-v)
+		fi
+	fi
+
+}
+
+get_system_prompt_file() {
+	prompt_basename="autocommit.prompt.md"
+	search_paths=("config/${prompt_basename}" "prompts/${prompt_basename}" ".well-known/${prompt_basename}" ".${prompt_basename}" "${HOME}/.config/git/${prompt_basename}" "/usr/local/etc/${prompt_basename}" "/etc/${prompt_basename}")
+	local syspromptfile=
+	for path in "${search_paths[@]}"; do
+		syspromptfile="$path"
+		[ -f "$syspromptfile" ] && break
+	done
+	if [ ! -e "$syspromptfile" ]; then
+		die "no system prompt file found ($prompt_basename)" || return 42
+		echo "ERROR_${RANDOM}_${RANDOM}" 1>&2
+		return 42
+	fi
+	grep -q "DO NOT COMMIT" "$syspromptfile" || {
+		die "incompatible system prompt file found ($prompt_basename)" || return 42
+		return 42
+	}
+	#  gumlog -l warn "syspromptfile=$syspromptfile" 1>&2
+	echo "$syspromptfile"
+}
+
+make_chatlist() {
+	jq -n \
+		--arg model "$1" \
+		--arg think "$2" \
+		--rawfile sys /dev/fd/3 \
+		--rawfile usr /dev/fd/4 \
+		'{
+      model: $model,
+      think: (
+        if $think == "true" or $think == "on" then true 
+        elif $think == "false" or $think == "off" then false 
+        elif $think == "null" or $think == "" then null 
+        else $think end
+      ),
+      duration: -1,
+      stream: false,
+      messages: [
+        {role: "system", content: $sys},
+        {role: "user", content: $usr}
+      ]
+    }' | jq -c
+	#| tee -a /dev/stderr
+}
+
+generate_commit() {
+	if [[ ! -e $syspromptfile ]]; then
+		loadenv || return $?
+		syspromptfile="${syspromptfile-"$(get_system_prompt_file)"}"
+	fi
+	[[ -n "$OLLAMA_MODEL" ]] || die "no OLLAMA_MODEL"
+	[[ -n "$OLLAMA_THINK" ]] || die "no OLLAMA_THINK"
+	[[ -n "$OLLAMA_HOST" ]] || die "no OLLAMA_HOST"
+	if [[ ! -e $syspromptfile ]]; then
+		die "gen no system prompt file (copy it to ~/.config/git/autocommit.prompt.md)"
+	fi
+	grep -q -E 'DO.NOT.COMMIT' "$syspromptfile" || die "incompatible system prompt file"
+	LOGFILE_DEBUG_XX112=/dev/null
+	#echo "making think=$OLLAMA_THINK model=$OLLAMA_MODEL" 1>&2
+
+	make_chatlist "$OLLAMA_MODEL" "$OLLAMA_THINK" 3<"$syspromptfile" 4<&0 | tee -a ${LOGFILE_DEBUG_XX112} |
+		curl -4 "${CURL_FLAGS[@]}" --json @- \
+			--url "${OLLAMA_HOST}/api/chat" \
+			-H 'Content-Type: application/json' || return $?
+	#echo "done making think=$OLLAMA_THINK model=$OLLAMA_MODEL" 1>&2
+}
+
+# make_diff returns 0 if diff available, prints diff to stdout
+make_diff() {
+	other=
+	if [ "${1-}" = X ]; then
+		other=--exit-code
+		shift
+		#  else
+		#    gumlog -l info staged:"staged: $(git diff --name-only --cached| tr '\n' ' ')" 1>&2
+	fi
+	#echo git --no-pager diff $other -U10 --no-prefix "${@}" "${DIFF_FLAGS[@]}" 1>&2
+	git --no-pager diff $other -U10 --no-prefix "${@}" "${DIFF_FLAGS[@]}"
+	return $?
+}
+# make_diff_staged returns 0 if diff available in staged, prints diff to stdout
+make_diff_staged() {
+	other=
+	if [ "${1-}" = X ]; then
+		other=--exit-code
+		shift
+		#  else
+		#    gumlog -l info staged:"staged: $(git diff --name-only --cached| tr '\n' ' ')" 1>&2
+	fi
+	#echo git --no-pager diff $other -U10 --staged --no-prefix "${@}" "${DIFF_FLAGS[@]}" 1>&2
+	git --no-pager diff $other -U10 --staged --no-prefix "${@}" "${DIFF_FLAGS[@]}"
+	return $?
+}
+
+do_git_add() {
+	gumlog -l debug "do_git_add going"
+	if [ "${#DIFF_FLAGS[@]}" = 0 ]; then
+		git --no-pager diff --staged --exit-code 2>/dev/null 1>/dev/null || return 0 # return early if already staged
+		gumlog -l warn "No diff add args" 1>&2
+		return 0
+	fi
+	git add "${DIFF_FLAGS[@]}"
+	ec=$?
+	git --no-pager diff --staged --exit-code "${DIFF_FLAGS[@]}" 1>/dev/null
+	if [ $ec -ne 0 ]; then
+		die "no staged changes -- forgot to use arguments?"
+	fi
+	return $ec
+}
+
+do_calc_time() {
+	local t2
+	t2=$(date +%s%3N)
+	local diff=$((t2 - autocommit_t1))
+	local millis=$((diff % 1000))
+	local seconds=$((diff / 1000))
+	if [ "${1-}" = "-q" ]; then
+		printf '%d.%03ds' "$seconds" "$millis"
+		return 0
+	fi
+	#  gumlog -l warn "OK: ${@}" 1>&2
+	# Only show minutes if they actually exist
+	if [ "$seconds" -ge 60 ]; then
+		gumlog -l info "$(printf 'finished generation in %dm %02d.%03ds\n' $((seconds / 60)) $((seconds % 60)) "$millis")"
+	else
+		gumlog -l info "$(printf 'finished generation in %d.%03ds\n' "$seconds" "$millis")"
+	fi
+}
+
+do_autocommit() {
+	gumlog -l debug "do_autocommit going" 1>&2
+	autocommit_t1=$(date +%s%3N)
+	### git add first if any
+	make_diff_staged X 1>/dev/null 2>/dev/null && do_git_add
+	make_diff_staged X 1>/dev/null 3>/dev/null && {
+		gumlog -l fatal "nothing staged: ${DIFF_FLAGS[*]}"
+		make_diff_staged
+		git status 1>&2
+		return 42
+	}
+	### send api request (takes some time..)
+	json_input=$(make_diff_staged)
+	echo "$json_input" | gum format -t code -l diff 1>/dev/stderr
+	staged_files="$(git diff --name-only --cached | tr '\n' ' ')"
+	gumlog -l info "sending: ${#json_input} bytes for staged: $staged_files"
+	json_output=$(generate_commit <<<"$json_input") || die "nothing staged?"
+	if [ "${#json_output}" -lt 3 ]; then
+		return 42
+	fi
+	# do_calc_time
+	#cat <<<"json_output=$json_output" 1>&2
+
+	### check for api errors
+	err=$(echo "$json_output" | jq -r .error || echo "null")
+	if [ "$err" != "null" ]; then
+		errorbox "We found an API error in the response."
+		gumlog -l fatal "$json_output"
+		return 29
+	fi
+
+	### unmarshal message from json
+	## TODO: smart_wrap
+	git_message=$(echo "$json_output" | jq -r .message.content) || fatal "no json"
+	if [ "$git_message" == "null" ]; then
+		print "We could not find the message content."
+		print "$json_output"
+		return 31
+	fi
+
+	### safety check
+	ok=0
+	grep -q -E 'DO.NOT.COMMIT' <<<"$git_message" || ok=$?
+	if [ -z "${ALLOW_ALL-}" ] && [ $ok == 0 ]; then
+		echo "GIT_MESSAGE=\"${git_message}\"" 1>&2
+		print "found keyword. not committing..." 1>&2
+		if true; then
+			return 31
+		fi
+		#	tset
+		gum confirm --default=No "Try anyways?" 1>/dev/stdout 2>/dev/stderr && {
+			gumlog -l warn "Allowing DO.NOT.COMMIT messages..."
+			export ALLOW_ALL=1
+			do_autocommit "${@}" # NOTE: RECURSION
+			return $?
+		}
+		gumlog -l warn "Use ALLOW_ALL=1 to try again (for example, while editing the autocommit script it may be necessary)" 1>&2
+		git status 1>&2
+		return 32
+	fi
+	## commit changes maybe
+	${echo-} git commit -q --no-verbose "${@}" -F - <<<"$git_message" 1>/dev/null 2>/dev/null
+	ec=$?
+	[ $ec -ne 0 ] && gumlog -l error "git commit failed" 1>&2
+	if [ "$ec" = 0 ]; then
+		do_lucky 1>&2
+		ec=$?
+		git --no-pager log --color=always -n 1 1>&2
+		#&& return 0
+		if [ $ec -ne 0 ]; then
+			gumlog -l warn "lucky_commit failed, review git log." 1>&2
+		fi
+		return 0
+	fi
+	return $ec
+}
+
+do_lucky() {
+	command -v lucky_commit 1>/dev/null || {
+		gumlog -l info "To use lucky-commit, run: sudo pacman -S opencl-nvidia lucky-commit"
+		return 0
+	}
+	CUR_SHA=$(git rev-parse HEAD)
+	if [ -z "${PREV_SHA-}" ] || [ "$CUR_SHA" = "$PREV_SHA" ]; then
+		gumlog -l warn "Not modifying previous commit..."
+		return 42
+	fi
+	lucky_commit 0000 || {
+		gumlog -l warn "lucky-commit failed... ignoring error"
+		return 0
+	}
+	# Find the most recent lucky_commit entry and delete it by its specific ID
+	git reflog show HEAD --grep-reflog="amend with lucky_commit" --format="%gD" -n 1 2>/dev/null | xargs -I {} git reflog delete "{}"
+
+}
+#in $(git diff-tree -r --name-only HEAD
+confirmation_loop() {
+	do_autocommit || return $?
+	infobox "Generation complete after $(do_calc_time -q 2>&1)\nFiles changed:\n\t$(git log --name-only --pretty="" HEAD~1..HEAD | sort -u)" 1>&2
+	if [ "$autoconfirm" = 1 ]; then
+		return 0
+	fi
+	### commit confirmation loop
+	show() {
+		[ "$silent_mode" = 1 ] && [ "${#}" = "0" ] && return 0
+		print "commit message as user $GIT_AUTHOR_NAME ($GIT_AUTHOR_EMAIL)" 1>&2
+		git ${MY_GIT_FLAGS-} log -n 1 --color "${@}" 1>&2
+	}
+	redo() {
+		undo || return $?
+		gumlog -l info "Regenerating commit message"
+		do_autocommit || return $?
+		show || return $?
+	}
+
+	show 1>&2 || true
+	options=(
+		"yes: commit is good"
+		"redo: undo AND regenerate commit message"
+		"no: undo the commit"
+		"show: print the patch"
+		"shownopager: print without pager"
+	)
+	default_yes="${options[0]}" || return 42
+	default_redo="${options[1]}" || return 42
+	default_show="${options[3]}" || return 42
+	case "${AC_DEFAULT_CONFIRM-}" in
+	yes)
+		selected="${default_yes}"
+		;;
+	no | redo | "")
+		selected="${default_redo}"
+		;;
+	*)
+		gumlog -l fatal "unknown AC_DEFAULT_CONFIRM env"
+		exit 42
+		;;
+	esac
+	got="${default_show}"
+	while [[ "$got" = show* ]]; do
+		CUR_SHA=$(git rev-parse HEAD)
+		if [ -z "$PREV_SHA" ]; then
+			gumlog -l fatal "no previous sha"
+			return 41
+
+		fi
+		if [ "$CUR_SHA" = "$PREV_SHA" ]; then
+			gumlog -l warn "Not modifying previous commit..."
+			return 42
+		fi
+		local msgheader="The generated commit is currently in place. Ctrl+c will undo it. How to proceed?"
+		got="$(gum choose --header="$msgheader" --selected="${selected}" "${options[@]}")" || {
+			undo || die "cancelled and FATAL: undo failed"
+			die "cancelled"
+			exit 2
+		}
+		ec=$?
+		got="$(cut -d: -f1 <<<"$got")"
+		case "${got}" in
+		yes)
+			return $?
+			;;
+		redo)
+			redo 1>&2 || die "redo failed"
+			got=show
+			;;
+		no | "")
+			return 22
+			;;
+		shownopager)
+			MY_GIT_FLAGS='--no-pager' show -p 1>&2
+			;;
+		show)
+			show -p 1>&2
+			;;
+		*)
+			die "unknown got=$got"
+			;;
+		esac
+		echo "gum ec=$ec got=$(cut -d: -f1 <<<"$got")" 1>&2
+	done
+
+	got="$(cut -d: -f1 <<<"$got")"
+	if [[ "$got" = yes ]]; then
+		return 0
+	fi
+	return 42
+}
+
+# subshell to protect set args
+do_main() (
+	echo doing main 1>&2
+	if ! command -v gum &>/dev/null; then
+		echo "Error: gum is not installed. Please install it to run this script."
+		exit 1 2>/dev/null || exit 1
+	fi
+	if ! command -v jq &>/dev/null; then
+		echo "Error: jq is not installed. Please install it to run this script."
+		exit 1 2>/dev/null || exit 1
+	fi
+	if ! command -v curl &>/dev/null; then
+		echo "Error: curl is not installed. Please install it to run this script."
+		exit 1 2>/dev/null || exit 1
+	fi
+
+	if [ -z "$GUM_LOG_LEVEL" ]; then
+		export GUM_LOG_LEVEL=${LOG_LEVEL-info}
+	fi
+	loadenv || return $?
+	if [[ ! -e $syspromptfile ]]; then
+		die "init no system prompt file"
+	fi
+	{
+		set -euo pipefail
+		autocommit_parse_flags "${@}" || {
+			die "flag parse failed"
+			exit 12
+		}
+
+		# first check if totally clean
+		if git diff --exit-code --quiet "${DIFF_FLAGS[@]}" && git diff --exit-code --quiet --staged "${DIFF_FLAGS[@]}" && ! git status --untracked-files --porcelain "${DIFF_FLAGS[@]}" | grep -q .; then
+			#      gumlog -l info "hmm.. No changes to commit? ARGS=${*} PARSED=${DIFF_FLAGS[@]}"
+			gumlog -l debug "git is clean"
+			return 0 2>/dev/null # || return 0
+		fi
+		if [ "${TESTING-${testing-}}" = "1" ]; then
+			make_diff_staged | generate_commit | jq -r .message.content
+			echo "exiting with code 100 for TESTING"
+			exit 100
+		fi
+		confirmation_loop || return $?
+		#[ "${silent_mode}SILENT" = "1SILENT" ] || git status | tr '\n' ' ' 1>&2
+	} 1>&2 || return $?
+	#	git rev-parse --short HEAD
+	git describe --tags --always
+	ec=$?
+	return $ec
+
+)
+
+## example usage
+##
+## source autocommit && echo Hello World | generate_commit | jq
+## source autocommit && autocommit_parse_flags -y -q && echo Hello World | generate_commit | jq
+
+syspromptfile="${syspromptfile-"$(get_system_prompt_file)"}" || return 2
+(return 0 2>/dev/null) || do_main "${@}" || exit $?
