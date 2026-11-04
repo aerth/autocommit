@@ -20,6 +20,8 @@ OLLAMA_HOST may be any OpenAI-compatible host. Script adds /v1/chat/completions 
 OLLAMA_MODEL=gemma4:12b
 OLLAMA_THINK=false
 OLLAMA_HOST=http://127.0.0.1:11434
+# optional
+LLM_API_KEY=xx
 ```
 
 Need environment: OLLAMA_MODEL OLLAMA_HOST OLLAMA_THINK
