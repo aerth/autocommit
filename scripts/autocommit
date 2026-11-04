@@ -34,6 +34,7 @@ loadenv() {
 	if [ "$OLLAMA_MODEL" = "gpt-oss:20b" ] && [ "${OLLAMA_THINK-off}" == "off" ]; then
 		OLLAMA_THINK=low
 	fi
+	LLM_API_KEY="${LLM_API_KEY-"xx"}"
 	gumlog -l debug "MODEL=$OLLAMA_MODEL THINK=$OLLAMA_THINK"
 	export GIT_AUTHOR_NAME=${GIT_AUTHOR_NAME-"${NAME-"developer"}"}
 	export GIT_AUTHOR_EMAIL=${GIT_AUTHOR_EMAIL-"${GIT_AUTHOR_NAME}@localhost"}
@@ -197,7 +198,7 @@ generate_commit() {
 	#echo "making think=$OLLAMA_THINK model=$OLLAMA_MODEL" 1>&2
 
 	make_chatlist "$OLLAMA_MODEL" "$OLLAMA_THINK" 3<"$syspromptfile" 4<&0 | tee -a ${LOGFILE_DEBUG_XX112} |
-		curl -4 "${CURL_FLAGS[@]}" --json @- \
+		curl -4 -H "Authorization: Bearer ${LLM_API_KEY}" "${CURL_FLAGS[@]}" --json @- \
 			--url "${OLLAMA_HOST}/v1/chat/completions" \
 			-H 'Content-Type: application/json' || return $?
 	#echo "done making think=$OLLAMA_THINK model=$OLLAMA_MODEL" 1>&2
