@@ -1,0 +1,109 @@
+#!/bin/bash
+# ac autocommit project (https://github.com/aerth/autocommit)
+#
+# with no arguments, ac calls autocommit in chunks (hunks)
+# otherwise, (eg: 'ac .')  will use entire file/dir.
+# before using, consider 'git status' to see what will be committed!
+export CLICOLOR_FORCE=1
+export FORCE_COLOR=1
+gumlog() {
+	# shellcheck disable=SC1001 ## for easy skip in find-and-replace
+	gum \log --prefix="ac: " "${@}" 1>&2
+}
+
+gather_changed() {
+	if [ ${#} -ne 1 ]; then
+		echo wtf
+		exit 3
+	fi
+	while IFS= read -r dir; do
+		if ! (git --no-pager diff --quiet -- "$dir" 2>/dev/null || ! git ls-files --others --exclude-standard -- "$dir" >/dev/null 2>&1); then
+			if git check-ignore --quiet "$dir"; then
+				echo "$dir" is gitignored 1>&2
+			else
+				CHANGED+=("$dir")
+				#        echo "Found: $dir" 1>&2
+			fi
+		fi
+	done < <(find . -mindepth "${1}" -maxdepth "${1}" -not -path '*/.git/*' -not -path '*/venv/*' -not -path '*/node_modules/*' -not -path '*/venv/*' -not -path '*/data/*' -not -path '*/.*env*' -not -path '*/*.log' -not -path "$HOME/source" || exit 2)
+	
+}
+gather_staged(){
+  mapfile -t additional < <(git diff --staged --name-only "${@}" | grep . |  xargs --no-run-if-empty -L1 dirname | sort | uniq)
+  CHANGED+=("${additional[@]}")
+}
+do_commit() {
+	echo "running:" "${autocommit[@]}" "${other[@]}" "${@}" |& sed 's/^/'"${autocommit[0]}"': /' 1>&2
+	"${autocommit[@]}" "${other[@]}" "${@}"  || {
+  #sed 's/^/'"${autocommit[0]}"': /' || {
+		ec=$?
+		gumlog -l warn "failed check above error"
+		return $ec
+	}
+	commit_count=$((commit_count + 1)) || {
+		ec=$?
+		gumlog -l warn "failed check above error"
+		return $ec
+	}
+	return 0
+}
+
+do_ac() {
+	set -euo pipefail
+	local autocommit=("autocommit")
+	local do_force=0
+	local other=()
+	local commit_count=0
+	local CHANGED=()
+	local target=''
+	if [ ${#} -eq 1 ]; then
+		case "${1}" in
+		"-v")
+			set -x
+			shift
+			;;
+		"-q")
+			other+=('-q')
+			shift
+			;;
+		'-y' | '-f')
+			do_force=1
+			shift
+			;;
+		*) ;;
+		esac
+	fi
+	if [ "$do_force" = 1 ]; then
+		other+=("-y")
+	fi
+	type "${autocommit[0]}" 1>/dev/null || {
+		gumlog -l fatal "command ${autocommit[0]@Q} not found in PATH"
+		exit 3
+	}
+	if [ ${#CHANGED[@]} -eq 0 ]; then
+	    gather_staged  "${@}"
+	fi
+	if [ ${#CHANGED[@]} -eq 0 ]; then
+		gather_changed 4
+		gather_changed 3
+		gather_changed 2
+		gather_changed 1
+	fi
+	if [ ${#CHANGED[@]} -eq 0 ]; then
+		gumlog -l info "no changes detected"
+		git status
+		exit 0
+	fi
+	{
+		printf 'Files with changes (%d):\n' "${#CHANGED[@]}"
+		printf '  %s\n' "${CHANGED[@]}"
+	} | gum style --foreground=3 1>&2
+	for target in "${CHANGED[@]}"; do
+		do_commit "$target" || exit 1
+	done
+	echo -n 'Done with commits: ' 1>&2
+	echo $commit_count
+	exit 0
+}
+
+(return 0 2>/dev/null) || do_ac "${@}" || exit $?
