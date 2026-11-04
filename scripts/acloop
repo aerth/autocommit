@@ -1,0 +1,308 @@
+#!/bin/bash
+# ac autocommit project (https://github.com/aerth/autocommit)
+#
+# acloop shows diffcards™, and calls 'ac -y' for ever.
+# uses desktop-notifications to signal when attention is needed.
+#
+# example usage: acloop 15 1 10
+#
+set -euo pipefail
+AFTERFUNC=${AFTERFUNC-:}
+paused=0
+trap '((paused = 1)) || true' SIGUSR1
+trap '((paused = 0)) || true' SIGUSR2
+MYPID=$$
+
+test -d .git || {
+  echo "run $0 in a git repo, while you edit files in another terminal"
+  exit 1
+}
+
+if [[ "$(declare -p ac_cmd 2>/dev/null)" != 'declare -a ac_cmd=('* ]]; then
+	#ac_cmd=("ac2")
+	ac_cmd=("ac" "-y")
+fi
+
+wdir=$(basename "$PWD")
+gumlog() {
+	local caller="${FUNCNAME[0]}:${BASH_LINENO[0]}"
+	# shellcheck disable=SC1001 ## for easy skip in find-and-replace
+	gum \log -trfc3339 --prefix="acloop ${wdir}:${caller} " "${@}" 1>&2
+}
+
+## BASH
+is_local_var() {
+	[[ $(declare -p "$1") == *"local"* ]] || return 2
+}
+
+## GIT
+has_staged_diff() {
+	{ git --no-pager diff --staged || true; } | grep -c ^diff || true
+}
+has_unstaged_diff() {
+	{ git --no-pager diff || true; } | grep -c ^diff || true
+}
+list_untracked_files() {
+	git --no-pager ls-files --exclude-standard --others
+}
+has_untracked_files() {
+	list_untracked_files | wc -l
+}
+
+## HELPER FMT
+add_s() {
+	[[ $1 -eq 1 ]] || echo "s"
+}
+plural() {
+	# eg: gumlog -l error "$n untracked $(plural "$n" files) present" 1>&2
+	# echo "$(plural $n file) present"         # "1 file" or "5 files"
+	# echo "$(plural $n entry entries) found" # "1 entry" or "5 entries"
+	local count=$1 singular=$2 || exit 2
+	local plural_form=${3:-${singular}s} # Defaults to adding 's' if 3rd arg missing
+
+	if [[ $count -eq 1 ]]; then
+		echo "$count $singular"
+	else
+		echo "$count $plural_form"
+	fi
+}
+
+## mod_older_than for waiter
+mod_older_than() {
+	local secs="$1"
+	if [[ $((secs + 1)) -lt 10 ]]; then
+		gumlog -l fatal "dev: invalid minutes for arg 1: ${secs@Q} ${FUNCNAME[0]}:${BASH_LINENO[0]}"
+		exit 2
+	fi
+	shift
+	local files=("$@")
+	local found_files=() newest_modified='' remaining=99999
+	local mins=$((secs / 60))
+	if [[ $mins -eq 0 ]]; then mins=1; fi
+	mapfile -t found_files < <(find "${files[@]}" -maxdepth 0 -type f -mmin -"$mins" -printf '%T@ %f\n' | sort -rn)
+	if [ "${#found_files[@]}" == 0 ]; then
+		gumlog -l info "All modified files are ready (${files[*]@Q})."
+		return 0 # Success: All files are old enough
+	fi
+	local remaining=1
+	while [[ "${#found_files[@]}" != 0 ]]; do
+		newest_modified=${found_files[0]} # in T F format still !!!
+		if [[ -z "$newest_modified" ]]; then
+			gumlog -l error "uhoh"
+			return 1
+		fi
+		remaining=$((secs - ($(date +%s) - ${newest_modified%%.*})))
+		if [[ $remaining -gt 0 ]]; then
+			break # found a real one to wait
+		fi
+		found_files=("${found_files[@]:1}")
+	done
+	if [[ "${#found_files[@]}" -eq 0 ]]; then
+		return 0
+	fi
+	newest_modified=${newest_modified#* } # remove T so its just filename
+	local sub_files=("${found_files[@]:1}")
+	sub_files=("${sub_files[@]#* }")
+	others=
+	if [ ${#sub_files[@]} != 0 ]; then
+		others="and others (${sub_files[*]@Q})"
+	fi
+
+	gumlog -l debug "waiting $remaining seconds since ${newest_modified@Q} $others"
+	return 1 # Failure: At least one file was modified recently
+}
+
+wait_for_finish_editing() {
+	local files=("$@")
+	if [[ ${#files[@]} == 0 ]]; then
+		return 1
+	fi
+	gumlog -l info "detected modified files=(${files[*]@Q}) waiting $confirmationwait for any last-minute changes"
+	until mod_older_than "${confirmationwait}" "${files[@]}"; do
+		sleep 2
+	done
+	gumlog -l info "ACTIVATION"
+	return 0
+}
+
+## acloop
+reload_status() {
+	nstaged=$(has_staged_diff) || gumlog -l warn "staged 1"
+	nunstaged=$(has_unstaged_diff) || gumlog -l warn "staged 1"
+	ndiffs=$((nstaged + nunstaged)) || gumlog -l warn "staged 1"
+	readarray -t untracked_files < <(list_untracked_files) || gumlog -l warn "staged 1"
+	nuntracked=$(has_untracked_files) || gumlog -l warn "staged 1"
+}
+reload_status_print() {
+	reload_status || return 1
+	gumlog -l info "Status: staged=$nstaged unstaged=$nunstaged untracked=$nuntracked" || return 2
+	return 0
+}
+# is_unblocked if any issues, logs a warning and returns non-zero
+is_unblocked() {
+	{
+		nuntracked=$(has_untracked_files) || {
+			echo there was a problem 1>&2
+			exit 1
+		}
+		if [ "$nuntracked" != 0 ]; then
+			gumlog -l error "blocked: $(plural "$nuntracked" "untracked file") present: ${untracked_files[*]@Q}" 1>&2
+			return 11
+		fi
+	} || return 1
+	if [ "$nuntracked" != 0 ]; then
+		gumlog -l error "blocked: $(plural "$nuntracked" "untracked file") present: ${untracked_files[*]@Q}" 1>&2
+		return 11
+	fi
+	return 0
+}
+reload_status_print 2>/dev/null || exit 3
+[[ "${ndiffs-0}" -gt 0 ]] || {
+	gumlog -l debug "nothing going on"
+	sleep 1
+}
+stash_maybe() {
+	if false && ! is_unblocked; then
+		gumlog -l warn "wow oh noo we are blocked!"
+		ec=0
+		mapfile -t selected < <(gum filter --input-delimiter=$'\t' --header "Choose files to STASH" --no-limit --reverse --height 7 < <(printf "%s\t" "${untracked_files[@]}"))
+		gumlog -l error "going now bye ec=$ec selected=(${selected[*]@Q})"
+		gumlog -l error "going now bye 2"
+		echo "test removing ${selected[*]@Q}"
+		gumlog -l fatal "wow nooo"
+		exit 10
+	fi
+}
+format_human() {
+	grep -E $'^(\x1b\[[0-9;]*m)*(diff|[+-])([^+1-]|$)'
+}
+print_box() {
+	gum style --border rounded --padding "0 1" --border-foreground "#04d9ff" --no-strip-ansi
+}
+print_current_boxes() {
+	output=$(git --no-pager diff --color=always -U2 HEAD | format_human | grep -a .) || ec=$?
+	if [ -z "$output" ] || [[ "$ec" != 0 ]]; then
+		return 0
+	fi
+	sep=$'\e[1mdiff'
+	mapfile -d $'\x01' diffcards <<<"${output//$sep/$'\x01'$sep}"
+	diffcards=("${diffcards[@]:1}") || diffcards=()
+	gumlog -l debug "found ${#diffcards[@]} diffcards" 1>&2
+	if [ "${#diffcards[@]}" -eq 0 ]; then
+		return 0
+	fi
+	for card in "${diffcards[@]}"; do
+		print_box <<<"$card" 1>&2
+	done
+}
+
+ask_consent() {
+	local prompt="${1}"
+	if [[ -z $prompt ]]; then
+		return 11
+	fi
+	gum confirm --default=No --no-show-help "${@}" || return $?
+}
+is_ready() {
+	reload_status || return 1
+	if ! is_unblocked; then
+		reason="blocked af"
+		gumlog -l warn "blocked: ${untracked_files[*]@Q}"
+		return 2
+	fi
+	if [[ $ndiffs -eq 0 && $nunstaged -eq 0 ]]; then
+		reason="no changes detected"
+		return 1
+	fi
+	# echo "args=${*@Q} ec=$?"
+	return "${paused}"
+}
+do_acloop() {
+	local tty
+	tty=$(tty)
+	if [ "${1-}" == "-h" ] || [ "${1-}" == "--help" ]; then
+		echo 1>&2 "usage: $0 [seconds] [cooldown] [confirmationwait]"
+		echo 1>&2 "for example,"
+		echo 1>&2 "    $0 60 60 120"
+		exit 3
+	fi
+	local seconds=3 cooldownwait=6 confirmationwait=35 reason=none untracked_files=() ec=0 nuntracked=0 nunstaged=0 nstaged=0 ndiffs=0
+	if [[ $((500 + ${1-0})) != 500 ]]; then
+		seconds=$1
+		shift
+	fi
+	if [[ $((500 + ${1-0})) != 500 ]]; then
+		cooldownwait=$1
+		shift
+	fi
+	if [[ $((500 + ${1-0})) != 500 ]]; then
+		confirmationwait=$1
+		shift
+	fi
+	show_header() {
+		gumlog -l info "checking every ${seconds} seconds, and waiting $confirmationwait seconds before acting, with $cooldownwait cooldown."
+	}
+	show_header
+
+	[[ -n "${ac_cmd[*]}" ]] || { # TODO: check
+		gumlog -l fatal "no ac_cmd"
+		return 2
+	}
+	show_pre_message() {
+		local files_diffed=()
+		mapfile -t files_diffed < <({
+			git diff --name-only
+			git diff --name-only --cached
+		} | sort -u)
+		echo 1>&2 # new line for dots ...
+		wait_for_finish_editing "${files_diffed[@]}" || {
+			return $?
+		}
+	}
+	gumlog -l info "Send USR1 signal to $MYPID to paused/unpause the loop"
+	while true; do
+		reason="no reason"
+		print_current_boxes || {
+			echo no boxes
+			return 2
+		}
+
+		if is_ready 1>/dev/null && show_pre_message && is_ready 1>/dev/null && [[ $paused == 0 ]]; then
+			echo 1>&2                                   # new line for dots ...
+			gumlog -l info "acloop activating: $ac_cmd" # first arg
+			ec=0
+			"${ac_cmd[@]}" || ec=$?
+			#"${ac_cmd[@]}" |& sed 's/^/'"${ac_cmd[0]}"': /' || ec=$?
+			if [ "$ec" != 0 ]; then
+				gumlog -l fatal "acloop returned from ${ac_cmd[0]@Q} with error code $ec" 1>&2
+				sleep 5
+				continue
+			fi
+			reason="no reason"
+			gumlog -l info "cooldown after $ac_cmd for $cooldownwait"
+			show_header
+			sleep "${cooldownwait-30}"
+			if [ -n "${AFTERFUNC}" ]; then $AFTERFUNC; fi || true
+			continue
+		fi
+		is_unblocked || {
+			notify-send -t 4000 "Git@$tty" "Untracked files present:\n$nuntracked file in $PWD"
+			[[ -n $reason ]] || reason="untracked files: ${untracked_files[*]@Q}"
+			show_header
+			sleep 5
+			continue
+		}
+		[[ -n $reason ]] || reason="no reason"
+		[[ "$paused" == 0 ]] || reason="paused"
+
+		if [ "$reason" != "no reason" ] && [ "$reason" != "no changes detected" ]; then
+			gumlog -l info "sleeping $seconds ($reason)"
+		else
+			echo -n . 1>&2
+		fi
+		sleep "${seconds-30}"
+	done
+}
+
+# example usage: acloop 15 1 10
+(return 0 2>/dev/null) || do_acloop "${@}" || exit 1
