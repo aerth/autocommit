@@ -165,12 +165,12 @@ make_chatlist() {
 		--rawfile usr /dev/fd/4 \
 		'{
       model: $model,
-      think: (
+      reasoning: {effort: (
         if $think == "true" or $think == "on" then true 
-        elif $think == "false" or $think == "off" then false 
+        elif $think == "false" or $think == "off" then "none" 
         elif $think == "null" or $think == "" then null 
         else $think end
-      ),
+      )},
       duration: -1,
       stream: false,
       messages: [
@@ -198,7 +198,7 @@ generate_commit() {
 
 	make_chatlist "$OLLAMA_MODEL" "$OLLAMA_THINK" 3<"$syspromptfile" 4<&0 | tee -a ${LOGFILE_DEBUG_XX112} |
 		curl -4 "${CURL_FLAGS[@]}" --json @- \
-			--url "${OLLAMA_HOST}/api/chat" \
+			--url "${OLLAMA_HOST}/v1/chat/completions" \
 			-H 'Content-Type: application/json' || return $?
 	#echo "done making think=$OLLAMA_THINK model=$OLLAMA_MODEL" 1>&2
 }
@@ -298,10 +298,10 @@ do_autocommit() {
 
 	### unmarshal message from json
 	## TODO: smart_wrap
-	git_message=$(echo "$json_output" | jq -r .message.content) || fatal "no json"
+	git_message=$(echo "$json_output" | jq -r '.choices[0].message.content') || fatal "no json"
 	if [ "$git_message" == "null" ]; then
-		print "We could not find the message content."
-		print "$json_output"
+		gumlog -l warn "We could not find the message content."
+		echo "$json_output" 1>&2
 		return 31
 	fi
 
@@ -456,7 +456,6 @@ confirmation_loop() {
 
 # subshell to protect set args
 do_main() (
-	echo doing main 1>&2
 	if ! command -v gum &>/dev/null; then
 		echo "Error: gum is not installed. Please install it to run this script."
 		exit 1 2>/dev/null || exit 1
