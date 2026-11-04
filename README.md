@@ -13,6 +13,8 @@ Edit the prompt file how you want. YMMV.
 
 Edit `~/.config/git/autocommit.env` with your ollama host details.
 
+OLLAMA_HOST may be any OpenAI-compatible host. Script adds /v1/chat/completions path.
+
 ```bash
 # ~/.config/git/autocommit.env
 OLLAMA_MODEL=gemma4:12b
